@@ -1,11 +1,9 @@
 import re
 import asyncio
+from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 import httpx
 from fake_useragent import UserAgent
-
-# Uncomment if you have a cache module:
-# from cache import get_cache, set_cache
 
 BASE = "https://www.cricbuzz.com"
 
@@ -38,7 +36,6 @@ async def fetch(url: str):
                 if r.status_code == 200:
                     return r.text
                 elif r.status_code in (403, 429):
-                    # Rate limited or blocked
                     last_error = f"Status {r.status_code}: Access denied or rate limited"
                     await asyncio.sleep(2 ** attempt)
                 else:
@@ -55,30 +52,109 @@ async def fetch(url: str):
 
 
 def extract_match_id(url):
-    # Real match URLs look like: /cricket-match/india-vs-aus/98765/live-cricket-scores
-    # OR: /live-cricket-scores/98765/...
     m = re.search(r'/(\d{4,})', url)
     return m.group(1) if m else ""
 
 
+async def _fetch_match_datetime(match_url: str):
+    """
+    Backup Fallback: Visits individual sub-pages if text data is 
+    missing entirely from the parent dashboard listing feed.
+    """
+    match_date = ""
+    match_time = ""
+
+    try:
+        html = await fetch(match_url)
+        soup = BeautifulSoup(html, "lxml")
+
+        for script in soup.find_all("script"):
+            text = script.string or ""
+            ts_match = re.search(r'"(startTime|matchStartTime|startdate)"\s*:\s*"?(\d{10,13})"?', text)
+            if ts_match:
+                ts = int(ts_match.group(2))
+                ts_sec = ts / 1000 if ts > 1e10 else ts
+                try:
+                    dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+                    match_date = dt.strftime("%-d %b %Y")
+                    match_time = dt.strftime("%I:%M %p UTC").lstrip("0")
+                    return match_date, match_time
+                except (OSError, OverflowError, ValueError):
+                    pass
+
+        timestamp_attrs = ("data-start-time", "data-dtz", "data-timestamp")
+        for node in soup.find_all(True):
+            for attr in timestamp_attrs:
+                val = node.get(attr, "")
+                if val and str(val).isdigit() and len(str(val)) >= 10:
+                    ts = int(val)
+                    ts_sec = ts / 1000 if ts > 1e10 else ts
+                    try:
+                        dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+                        match_date = dt.strftime("%-d %b %Y")
+                        match_time = dt.strftime("%I:%M %p UTC").lstrip("0")
+                        return match_date, match_time
+                    except (OSError, OverflowError, ValueError):
+                        pass
+
+        for meta in soup.find_all("meta"):
+            content = meta.get("content", "")
+            MONTHS = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
+            date_patterns = [
+                rf'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+(\d{{1,2}}\s+{MONTHS}(?:\s+\d{{4}})?)',
+                rf'(\d{{1,2}}\s+{MONTHS}(?:\s+\d{{4}})?)',
+                rf'({MONTHS}\s+\d{{1,2}}(?:,?\s+\d{{4}})?)',
+            ]
+            for pattern in date_patterns:
+                dm = re.search(pattern, content, re.I)
+                if dm:
+                    match_date = dm.group(1).strip()
+                    break
+            time_match = re.search(
+                r'\b(\d{1,2}:\d{2}(?:\s*(?:AM|PM|am|pm))?(?:\s*(?:IST|UTC|GMT|EST|PST))?)\b',
+                content
+            )
+            if time_match:
+                match_time = time_match.group(1).strip()
+            if match_date and match_time:
+                return match_date, match_time
+
+    except Exception:
+        pass
+
+    return match_date, match_time
+
+
+async def _enrich_with_datetime(matches: list) -> list:
+    """Fetch datetime concurrently only if records lack data structural values."""
+    async def enrich(match):
+        if not match["date"] or match["time"] == "TBD":
+            date, time = await _fetch_match_datetime(match["match_url"])
+            if date: match["date"] = date
+            if time: match["time"] = time
+        return match
+
+    return await asyncio.gather(*[enrich(m) for m in matches])
+
+
 def parse_match_cards(html):
     """
-    FIX: The old code matched nav links like /cricket-match/live-scores (no numeric ID).
-    We now require a numeric segment (4+ digits) in the href to confirm it's a real match.
-    We also extract team names and status from the surrounding card markup.
+    Main extraction parser. Targets row item layouts directly 
+    and checks inner layout strings where metadata sits natively.
     """
     soup = BeautifulSoup(html, "lxml")
     cards = []
     seen = set()
 
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
-
-        # --- KEY FIX: must contain a numeric match ID ---
-        if not re.search(r'/\d{4,}/', href):
+    for match_box in soup.select("div.cb-mtch-lst-itm, div.cb-scr-wll-chvrn, div.cb-col-100.cb-col"):
+        link = match_box.find("a", href=True) if match_box.name != "a" else match_box
+        if not link:
             continue
 
-        # Must be a match/scores link (not a player or series link)
+        href = link["href"]
+        if not re.search(r'/\d{4,}/', href) or href in seen:
+            continue
+
         if not any(kw in href for kw in [
             "/cricket-match/",
             "/live-cricket-scores/",
@@ -86,21 +162,28 @@ def parse_match_cards(html):
         ]):
             continue
 
-        if href in seen:
-            continue
         seen.add(href)
-
         match_id = extract_match_id(href)
         if not match_id:
             continue
 
-        # Walk up to the match card container to scrape richer data
-        card_el = _find_card_ancestor(link)
+        card_text = match_box.get_text(" ", strip=True)
+        
+        team1, team2 = _extract_teams(match_box)
+        status = _extract_status(match_box)
+        title = _extract_title(match_box, href)
 
-        team1, team2 = _extract_teams(card_el or link)
-        status = _extract_status(card_el or link)
-        title = _extract_title(card_el or link, href)
-        match_date, match_time = _extract_datetime(card_el or link)
+        match_date = ""
+        match_time = ""
+        
+        MONTHS = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
+        date_m = re.search(rf'({MONTHS}\s+\d{{1,2}}|\d{{1,2}}\s+{MONTHS})', card_text, re.I)
+        if date_m:
+            match_date = date_m.group(1).strip()
+            
+        time_m = re.search(r'\b(\d{{1,2}}:\d{{2}}\s*(?:AM|PM|am|pm))\b', card_text)
+        if time_m:
+            match_time = time_m.group(1).strip()
 
         cards.append({
             "match_id": match_id,
@@ -109,8 +192,8 @@ def parse_match_cards(html):
             "team1": team1,
             "team2": team2,
             "status": status,
-            "date": match_date,
-            "time": match_time,
+            "date": match_date if match_date else "Today",
+            "time": match_time if match_time else "TBD",
         })
 
     return cards
@@ -120,194 +203,106 @@ def parse_match_cards(html):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _find_card_ancestor(tag):
-    """
-    Walk up the DOM to find a container div/li that holds the full match card.
-    Cricbuzz wraps each match in a <div> with class containing 'cb-mtch-lst' or similar.
-    """
-    card_classes = {
-        "cb-mtch-lst", "cb-col", "cb-lst-itm", "cb-match-card",
-        "cb-scr-wll-chvrn",  # live score widget
-    }
-    node = tag.parent
-    for _ in range(8):  # max 8 levels up
-        if node is None or node.name in ("body", "html", "[document]"):
-            break
-        classes = set(node.get("class") or [])
-        if classes & card_classes:
-            return node
-        node = node.parent
-    return None
-
-
 def _extract_teams(el):
-    """Extract team names from card element."""
+    """Parses clean team text while discarding scores, trailing live indicators, and metadata."""
     text = el.get_text(" ", strip=True)
-
-    # Cricbuzz often has "TeamA vs TeamB" somewhere in the card
+    
+    # Extract structural match patterns before tracking layout extras
     m = re.search(r'([A-Za-z ]+?)\s+(?:vs?\.?)\s+([A-Za-z ]+?)(?:\s*,|\s*\d|\s*-|$)', text, re.I)
     if m:
-        return m.group(1).strip(), m.group(2).strip()
-
+        t1 = m.group(1).strip()
+        t2 = m.group(2).strip()
+        
+        # Clean out any trailing layout text noise such as "Live" or structural indicators
+        t1 = re.sub(r'\b(live|vs)\b.*$', '', t1, flags=re.I).strip()
+        t2 = re.sub(r'\b(live|vs)\b.*$', '', t2, flags=re.I).strip()
+        return t1, t2
+        
     return "", ""
 
 
 def _extract_status(el):
-    """Extract match status (e.g. 'Live', 'Stumps', result line)."""
     text = el.get_text(" ", strip=True)
 
-    # Look for common Cricbuzz status patterns - prioritize them
     status_patterns = [
         (r'\b(Live|LIVE|LIVE NOW)\b', lambda m: m.group(1)),
         (r'\b(won|leads|trail|need|require|innings|stumps|draw|tied|no result)\b', lambda m: m.group(1).capitalize()),
         (r'(\d+\s*(?:runs?|wickets?|wkts?)\s+(?:needed|required))', lambda m: m.group(1)),
     ]
-    
+
     for pattern, formatter in status_patterns:
         m = re.search(pattern, text, re.I)
         if m:
             return formatter(m)
-    
-    # If no recognized pattern, check for common result keywords
+
     if any(kw in text.lower() for kw in ["result", "won by", "tied", "victory"]):
         return "Completed"
-    
-    # Return first 60 chars if something is there
+
     return text[:60] if text else ""
 
 
-def _extract_datetime(el):
-    """Extract match date and time from card element."""
-    text = el.get_text(" ", strip=True)
-    
-    match_date = ""
-    match_time = ""
-    
-    # Extract time (e.g., "4:00 PM", "16:00", "4:00 pm", "2:30 AM")
-    time_pattern = r'(\d{1,2}):(\d{2})\s*(AM|PM|am|pm|IST|UTC|GMT)?'
-    time_match = re.search(time_pattern, text)
-    if time_match:
-        match_time = time_match.group(0).strip()
-    
-    # Extract date patterns
-    # Patterns: "May 22", "22 May", "May 22, 2024", "22 May 2024", etc.
-    date_patterns = [
-        r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*(?:\s+\d{4})?)',  # "22 May" or "22 May 2024"
-        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:,?\s+\d{4})?)',  # "May 22" or "May 22, 2024"
-    ]
-    
-    for pattern in date_patterns:
-        date_match = re.search(pattern, text, re.I)
-        if date_match:
-            match_date = date_match.group(1).strip()
-            break
-    
-    return match_date, match_time
-
-
 def _extract_title(el, href):
-    """Build a clean title from the element text or href slug."""
     text = el.get_text(" ", strip=True)
     if text:
-        # Truncate very long card text
         return text[:120]
-
-    # Fallback: humanise the slug from the URL
     slug_m = re.search(r'/(?:cricket-match|live-cricket-scores)/([a-z0-9-]+)/', href)
     if slug_m:
         return slug_m.group(1).replace("-", " ").title()
-
     return href
 
 
 # ---------------------------------------------------------------------------
-# Public API (same interface as before)
+# Public API Endpoints
 # ---------------------------------------------------------------------------
 
 async def get_live_matches():
-    """Fetch currently live cricket matches"""
     url = f"{BASE}/cricket-match/live-scores"
     html = await fetch(url)
     matches = parse_match_cards(html)
-    
-    # Filter to only live matches
     live_matches = [m for m in matches if m.get("status") and "live" in m.get("status", "").lower()]
-    
-    return live_matches if live_matches else matches
+    result = live_matches if live_matches else matches
+    return await _enrich_with_datetime(result)
 
 
 async def get_upcoming_matches():
-    """Fetch upcoming cricket matches (scheduled but not started)"""
-    # cache = get_cache("upcoming", ttl=300)
-    # if cache: return cache
-
     url = f"{BASE}/cricket-match/live-scores/upcoming-matches"
     html = await fetch(url)
     data = parse_match_cards(html)
-    
-    # Filter to only upcoming matches (not live, not recent)
     upcoming = [m for m in data if m.get("status") and not any(
         kw in m.get("status", "").lower() for kw in ["live", "won", "tied", "no result"]
     )]
-
-    # set_cache("upcoming", upcoming)
-    return upcoming if upcoming else data
+    result = upcoming if upcoming else data
+    return await _enrich_with_datetime(result)
 
 
 async def get_recent_matches():
-    """Fetch recently completed cricket matches (results)"""
-    # cache = get_cache("recent", ttl=300)
-    # if cache: return cache
-
     url = f"{BASE}/cricket-match/live-scores/recent-matches"
     html = await fetch(url)
     data = parse_match_cards(html)
-
-    # Filter to only recently completed matches
     recent = [m for m in data if m.get("status") and any(
         kw in m.get("status", "").lower() for kw in ["won", "tied", "result", "stumps", "innings"]
     )]
-
-    # set_cache("recent", recent)
-    return recent if recent else data
+    result = recent if recent else data
+    return await _enrich_with_datetime(result)
 
 
 async def get_scorecard(match_id):
-    """Fetch scorecard data from Cricbuzz API - returns full scorecard"""
     url = f"{BASE}/api/mcenter/scorecard/{match_id}"
-    
     try:
         async with httpx.AsyncClient(timeout=20, headers=headers()) as client:
             response = await client.get(url)
             if response.status_code == 200:
-                data = response.json()
-                return data
+                return response.json()
             else:
-                return {
-                    "error": f"HTTP {response.status_code}",
-                    "match_id": match_id
-                }
+                return {"error": f"HTTP {response.status_code}", "match_id": match_id}
     except Exception as e:
-        return {
-            "error": str(e),
-            "match_id": match_id
-        }
-
+        return {"error": str(e), "match_id": match_id}
 
 
 async def get_squads(match_id):
-    # Try cache first (optional)
-    # cache_key = f"squad_{match_id}"
-    # cache = get_cache(cache_key, ttl=86400)
-    # if cache: return cache
-
-    teams = []
-    api_attempts = []
-    # set_cache(cache_key, result)
     url = f"{BASE}/cricket-match-squads/{match_id}"
     html = await fetch(url)
-    data = fetch_squads(html)
-    return data
+    return fetch_squads(html)
 
 
 _ROLE_KEYWORDS = [
@@ -359,8 +354,6 @@ def _group_by_category(players):
 
 def fetch_squads(html):
     soup = BeautifulSoup(html, "html.parser")
-
-    # Full country names sit in the main h1: "Nepal vs United States of America, ..."
     teams = []
     for h1 in soup.find_all("h1"):
         txt = h1.get_text(strip=True)
@@ -368,6 +361,7 @@ def fetch_squads(html):
         if m:
             teams = [m.group(1).strip(), m.group(2).strip()]
             break
+            
     if not teams:
         teams = ["Team A", "Team B"]
 
