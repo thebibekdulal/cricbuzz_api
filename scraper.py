@@ -5,9 +5,6 @@ from bs4 import BeautifulSoup
 import httpx
 from fake_useragent import UserAgent
 
-# Uncomment if you have a cache module:
-# from cache import get_cache, set_cache
-
 BASE = "https://www.cricbuzz.com"
 
 ua = UserAgent()
@@ -59,6 +56,131 @@ def extract_match_id(url):
     return m.group(1) if m else ""
 
 
+async def _fetch_match_datetime(match_url: str):
+    """
+    Visits the individual match page and extracts date + time.
+    Cricbuzz stores the timestamp in a <meta> tag or data attributes
+    on the match info bar — much more reliable than the listing page.
+    """
+    match_date = ""
+    match_time = ""
+
+    try:
+        html = await fetch(match_url)
+        soup = BeautifulSoup(html, "lxml")
+
+        # ── Strategy 1: <script> JSON-LD or window.__INITIAL_STATE__ ────────
+        # Cricbuzz sometimes embeds match start time in a script block
+        for script in soup.find_all("script"):
+            text = script.string or ""
+            # Look for Unix timestamp patterns in JS vars
+            ts_match = re.search(r'"(?:startTime|matchStartTime|startdate)"\s*:\s*"?(\d{10,13})"?', text)
+            if ts_match:
+                ts = int(ts_match.group(1))
+                ts_sec = ts / 1000 if ts > 1e10 else ts
+                try:
+                    dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+                    match_date = dt.strftime("%-d %b %Y")
+                    match_time = dt.strftime("%I:%M %p UTC").lstrip("0")
+                    return match_date, match_time
+                except (OSError, OverflowError, ValueError):
+                    pass
+
+        # ── Strategy 2: data-* attributes anywhere in the page ──────────────
+        timestamp_attrs = ("data-start-time", "data-dtz", "data-timestamp")
+        for node in soup.find_all(True):
+            for attr in timestamp_attrs:
+                val = node.get(attr, "")
+                if val and str(val).isdigit() and len(str(val)) >= 10:
+                    ts = int(val)
+                    ts_sec = ts / 1000 if ts > 1e10 else ts
+                    try:
+                        dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+                        match_date = dt.strftime("%-d %b %Y")
+                        match_time = dt.strftime("%I:%M %p UTC").lstrip("0")
+                        return match_date, match_time
+                    except (OSError, OverflowError, ValueError):
+                        pass
+
+        # ── Strategy 3: meta tags ────────────────────────────────────────────
+        for meta in soup.find_all("meta"):
+            content = meta.get("content", "")
+            # e.g. <meta name="description" content="... May 22, 2025 ...">
+            MONTHS = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
+            date_patterns = [
+                rf'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+(\d{{1,2}}\s+{MONTHS}(?:\s+\d{{4}})?)',
+                rf'(\d{{1,2}}\s+{MONTHS}(?:\s+\d{{4}})?)',
+                rf'({MONTHS}\s+\d{{1,2}}(?:,?\s+\d{{4}})?)',
+            ]
+            for pattern in date_patterns:
+                dm = re.search(pattern, content, re.I)
+                if dm:
+                    match_date = dm.group(1).strip()
+                    break
+            time_match = re.search(
+                r'\b(\d{1,2}:\d{2}(?:\s*(?:AM|PM|am|pm))?(?:\s*(?:IST|UTC|GMT|EST|PST))?)\b',
+                content
+            )
+            if time_match:
+                match_time = time_match.group(1).strip()
+            if match_date and match_time:
+                return match_date, match_time
+
+        # ── Strategy 4: match info bar text ─────────────────────────────────
+        # Cricbuzz has a cb-minfo-details or cb-mtch-info div with date/time text
+        info_selectors = [
+            "div.cb-minfo-details",
+            "div.cb-mtch-info",
+            "div.cb-nav-subhdr",
+            "span.schedule-date",
+            "div[class*='cb-minfo']",
+            "div[class*='match-info']",
+        ]
+        for selector in info_selectors:
+            el = soup.select_one(selector)
+            if not el:
+                continue
+            text = el.get_text(" ", strip=True)
+
+            MONTHS = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
+            date_patterns = [
+                rf'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+(\d{{1,2}}\s+{MONTHS}(?:\s+\d{{4}})?)',
+                rf'(\d{{1,2}}\s+{MONTHS}(?:\s+\d{{4}})?)',
+                rf'({MONTHS}\s+\d{{1,2}}(?:,?\s+\d{{4}})?)',
+            ]
+            for pattern in date_patterns:
+                dm = re.search(pattern, text, re.I)
+                if dm:
+                    match_date = dm.group(1).strip()
+                    break
+
+            time_match = re.search(
+                r'\b(\d{1,2}:\d{2}(?:\s*(?:AM|PM|am|pm))?(?:\s*(?:IST|UTC|GMT|EST|PST))?)\b',
+                text
+            )
+            if time_match:
+                match_time = time_match.group(1).strip()
+
+            if match_date or match_time:
+                return match_date, match_time
+
+    except Exception:
+        pass
+
+    return match_date, match_time
+
+
+async def _enrich_with_datetime(matches: list) -> list:
+    """Fetch datetime for all matches concurrently."""
+    async def enrich(match):
+        date, time = await _fetch_match_datetime(match["match_url"])
+        match["date"] = date
+        match["time"] = time
+        return match
+
+    return await asyncio.gather(*[enrich(m) for m in matches])
+
+
 def parse_match_cards(html):
     soup = BeautifulSoup(html, "lxml")
     cards = []
@@ -90,7 +212,6 @@ def parse_match_cards(html):
         team1, team2 = _extract_teams(card_el or link)
         status = _extract_status(card_el or link)
         title = _extract_title(card_el or link, href)
-        match_date, match_time = _extract_datetime(card_el or link)
 
         cards.append({
             "match_id": match_id,
@@ -99,8 +220,8 @@ def parse_match_cards(html):
             "team1": team1,
             "team2": team2,
             "status": status,
-            "date": match_date,
-            "time": match_time,
+            "date": "",
+            "time": "",
         })
 
     return cards
@@ -156,66 +277,6 @@ def _extract_status(el):
     return text[:60] if text else ""
 
 
-def _extract_datetime(el):
-    match_date = ""
-    match_time = ""
-
-    # ── Strategy 1: data attribute (Unix milliseconds) ──────────────────────
-    timestamp_attrs = ("data-start-time", "data-dtz", "data-timestamp")
-    ts_ms = None
-
-    candidates = [el] + list(el.find_all(True, limit=40))
-    for node in candidates:
-        for attr in timestamp_attrs:
-            val = node.get(attr, "")
-            if val and val.isdigit() and len(val) >= 10:
-                ts_ms = int(val)
-                break
-        if ts_ms:
-            break
-
-    if ts_ms:
-        ts_sec = ts_ms / 1000 if ts_ms > 1e10 else ts_ms
-        try:
-            dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
-            match_date = dt.strftime("%-d %b %Y")
-            match_time = dt.strftime("%I:%M %p UTC").lstrip("0")
-            return match_date, match_time
-        except (OSError, OverflowError, ValueError):
-            pass
-
-    # ── Strategy 2: broadened text regex fallback ────────────────────────────
-    text_parts = []
-    for child in el.children:
-        chunk = child.get_text(" ", strip=True) if hasattr(child, "get_text") else str(child).strip()
-        if chunk:
-            text_parts.append(chunk)
-    text = " ".join(text_parts)
-
-    # Time
-    time_match = re.search(
-        r'\b(\d{1,2}:\d{2}(?:\s*(?:AM|PM|am|pm))?(?:\s*(?:IST|UTC|GMT|EST|PST))?)\b',
-        text
-    )
-    if time_match:
-        match_time = time_match.group(1).strip()
-
-    # Date
-    MONTHS = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
-    date_patterns = [
-        rf'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+(\d{{1,2}}\s+{MONTHS}(?:\s+\d{{4}})?)',
-        rf'(\d{{1,2}}\s+{MONTHS}(?:\s+\d{{4}})?)',
-        rf'({MONTHS}\s+\d{{1,2}}(?:,?\s+\d{{4}})?)',
-    ]
-    for pattern in date_patterns:
-        date_match = re.search(pattern, text, re.I)
-        if date_match:
-            match_date = date_match.group(1).strip()
-            break
-
-    return match_date, match_time
-
-
 def _extract_title(el, href):
     text = el.get_text(" ", strip=True)
     if text:
@@ -235,7 +296,8 @@ async def get_live_matches():
     html = await fetch(url)
     matches = parse_match_cards(html)
     live_matches = [m for m in matches if m.get("status") and "live" in m.get("status", "").lower()]
-    return live_matches if live_matches else matches
+    result = live_matches if live_matches else matches
+    return await _enrich_with_datetime(result)
 
 
 async def get_upcoming_matches():
@@ -245,7 +307,8 @@ async def get_upcoming_matches():
     upcoming = [m for m in data if m.get("status") and not any(
         kw in m.get("status", "").lower() for kw in ["live", "won", "tied", "no result"]
     )]
-    return upcoming if upcoming else data
+    result = upcoming if upcoming else data
+    return await _enrich_with_datetime(result)
 
 
 async def get_recent_matches():
@@ -255,7 +318,8 @@ async def get_recent_matches():
     recent = [m for m in data if m.get("status") and any(
         kw in m.get("status", "").lower() for kw in ["won", "tied", "result", "stumps", "innings"]
     )]
-    return recent if recent else data
+    result = recent if recent else data
+    return await _enrich_with_datetime(result)
 
 
 async def get_scorecard(match_id):
