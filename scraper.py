@@ -1,5 +1,6 @@
 import re
 import asyncio
+from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 import httpx
 from fake_useragent import UserAgent
@@ -38,7 +39,6 @@ async def fetch(url: str):
                 if r.status_code == 200:
                     return r.text
                 elif r.status_code in (403, 429):
-                    # Rate limited or blocked
                     last_error = f"Status {r.status_code}: Access denied or rate limited"
                     await asyncio.sleep(2 ** attempt)
                 else:
@@ -55,18 +55,11 @@ async def fetch(url: str):
 
 
 def extract_match_id(url):
-    # Real match URLs look like: /cricket-match/india-vs-aus/98765/live-cricket-scores
-    # OR: /live-cricket-scores/98765/...
     m = re.search(r'/(\d{4,})', url)
     return m.group(1) if m else ""
 
 
 def parse_match_cards(html):
-    """
-    FIX: The old code matched nav links like /cricket-match/live-scores (no numeric ID).
-    We now require a numeric segment (4+ digits) in the href to confirm it's a real match.
-    We also extract team names and status from the surrounding card markup.
-    """
     soup = BeautifulSoup(html, "lxml")
     cards = []
     seen = set()
@@ -74,11 +67,9 @@ def parse_match_cards(html):
     for link in soup.find_all("a", href=True):
         href = link["href"]
 
-        # --- KEY FIX: must contain a numeric match ID ---
         if not re.search(r'/\d{4,}/', href):
             continue
 
-        # Must be a match/scores link (not a player or series link)
         if not any(kw in href for kw in [
             "/cricket-match/",
             "/live-cricket-scores/",
@@ -94,7 +85,6 @@ def parse_match_cards(html):
         if not match_id:
             continue
 
-        # Walk up to the match card container to scrape richer data
         card_el = _find_card_ancestor(link)
 
         team1, team2 = _extract_teams(card_el or link)
@@ -121,16 +111,14 @@ def parse_match_cards(html):
 # ---------------------------------------------------------------------------
 
 def _find_card_ancestor(tag):
-    """
-    Walk up the DOM to find a container div/li that holds the full match card.
-    Cricbuzz wraps each match in a <div> with class containing 'cb-mtch-lst' or similar.
-    """
     card_classes = {
-        "cb-mtch-lst", "cb-col", "cb-lst-itm", "cb-match-card",
-        "cb-scr-wll-chvrn",  # live score widget
+        "cb-mtch-lst-itm",
+        "cb-lst-itm",
+        "cb-match-card",
+        "cb-scr-wll-chvrn",
     }
     node = tag.parent
-    for _ in range(8):  # max 8 levels up
+    for _ in range(6):
         if node is None or node.name in ("body", "html", "[document]"):
             break
         classes = set(node.get("class") or [])
@@ -141,141 +129,137 @@ def _find_card_ancestor(tag):
 
 
 def _extract_teams(el):
-    """Extract team names from card element."""
     text = el.get_text(" ", strip=True)
-
-    # Cricbuzz often has "TeamA vs TeamB" somewhere in the card
     m = re.search(r'([A-Za-z ]+?)\s+(?:vs?\.?)\s+([A-Za-z ]+?)(?:\s*,|\s*\d|\s*-|$)', text, re.I)
     if m:
         return m.group(1).strip(), m.group(2).strip()
-
     return "", ""
 
 
 def _extract_status(el):
-    """Extract match status (e.g. 'Live', 'Stumps', result line)."""
     text = el.get_text(" ", strip=True)
 
-    # Look for common Cricbuzz status patterns - prioritize them
     status_patterns = [
         (r'\b(Live|LIVE|LIVE NOW)\b', lambda m: m.group(1)),
         (r'\b(won|leads|trail|need|require|innings|stumps|draw|tied|no result)\b', lambda m: m.group(1).capitalize()),
         (r'(\d+\s*(?:runs?|wickets?|wkts?)\s+(?:needed|required))', lambda m: m.group(1)),
     ]
-    
+
     for pattern, formatter in status_patterns:
         m = re.search(pattern, text, re.I)
         if m:
             return formatter(m)
-    
-    # If no recognized pattern, check for common result keywords
+
     if any(kw in text.lower() for kw in ["result", "won by", "tied", "victory"]):
         return "Completed"
-    
-    # Return first 60 chars if something is there
+
     return text[:60] if text else ""
 
 
 def _extract_datetime(el):
-    """Extract match date and time from card element."""
-    text = el.get_text(" ", strip=True)
-    
     match_date = ""
     match_time = ""
-    
-    # Extract time (e.g., "4:00 PM", "16:00", "4:00 pm", "2:30 AM")
-    time_pattern = r'(\d{1,2}):(\d{2})\s*(AM|PM|am|pm|IST|UTC|GMT)?'
-    time_match = re.search(time_pattern, text)
+
+    # ── Strategy 1: data attribute (Unix milliseconds) ──────────────────────
+    timestamp_attrs = ("data-start-time", "data-dtz", "data-timestamp")
+    ts_ms = None
+
+    candidates = [el] + list(el.find_all(True, limit=40))
+    for node in candidates:
+        for attr in timestamp_attrs:
+            val = node.get(attr, "")
+            if val and val.isdigit() and len(val) >= 10:
+                ts_ms = int(val)
+                break
+        if ts_ms:
+            break
+
+    if ts_ms:
+        ts_sec = ts_ms / 1000 if ts_ms > 1e10 else ts_ms
+        try:
+            dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+            match_date = dt.strftime("%-d %b %Y")
+            match_time = dt.strftime("%I:%M %p UTC").lstrip("0")
+            return match_date, match_time
+        except (OSError, OverflowError, ValueError):
+            pass
+
+    # ── Strategy 2: broadened text regex fallback ────────────────────────────
+    text_parts = []
+    for child in el.children:
+        chunk = child.get_text(" ", strip=True) if hasattr(child, "get_text") else str(child).strip()
+        if chunk:
+            text_parts.append(chunk)
+    text = " ".join(text_parts)
+
+    # Time
+    time_match = re.search(
+        r'\b(\d{1,2}:\d{2}(?:\s*(?:AM|PM|am|pm))?(?:\s*(?:IST|UTC|GMT|EST|PST))?)\b',
+        text
+    )
     if time_match:
-        match_time = time_match.group(0).strip()
-    
-    # Extract date patterns
-    # Patterns: "May 22", "22 May", "May 22, 2024", "22 May 2024", etc.
+        match_time = time_match.group(1).strip()
+
+    # Date
+    MONTHS = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
     date_patterns = [
-        r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*(?:\s+\d{4})?)',  # "22 May" or "22 May 2024"
-        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:,?\s+\d{4})?)',  # "May 22" or "May 22, 2024"
+        rf'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+(\d{{1,2}}\s+{MONTHS}(?:\s+\d{{4}})?)',
+        rf'(\d{{1,2}}\s+{MONTHS}(?:\s+\d{{4}})?)',
+        rf'({MONTHS}\s+\d{{1,2}}(?:,?\s+\d{{4}})?)',
     ]
-    
     for pattern in date_patterns:
         date_match = re.search(pattern, text, re.I)
         if date_match:
             match_date = date_match.group(1).strip()
             break
-    
+
     return match_date, match_time
 
 
 def _extract_title(el, href):
-    """Build a clean title from the element text or href slug."""
     text = el.get_text(" ", strip=True)
     if text:
-        # Truncate very long card text
         return text[:120]
-
-    # Fallback: humanise the slug from the URL
     slug_m = re.search(r'/(?:cricket-match|live-cricket-scores)/([a-z0-9-]+)/', href)
     if slug_m:
         return slug_m.group(1).replace("-", " ").title()
-
     return href
 
 
 # ---------------------------------------------------------------------------
-# Public API (same interface as before)
+# Public API
 # ---------------------------------------------------------------------------
 
 async def get_live_matches():
-    """Fetch currently live cricket matches"""
     url = f"{BASE}/cricket-match/live-scores"
     html = await fetch(url)
     matches = parse_match_cards(html)
-    
-    # Filter to only live matches
     live_matches = [m for m in matches if m.get("status") and "live" in m.get("status", "").lower()]
-    
     return live_matches if live_matches else matches
 
 
 async def get_upcoming_matches():
-    """Fetch upcoming cricket matches (scheduled but not started)"""
-    # cache = get_cache("upcoming", ttl=300)
-    # if cache: return cache
-
     url = f"{BASE}/cricket-match/live-scores/upcoming-matches"
     html = await fetch(url)
     data = parse_match_cards(html)
-    
-    # Filter to only upcoming matches (not live, not recent)
     upcoming = [m for m in data if m.get("status") and not any(
         kw in m.get("status", "").lower() for kw in ["live", "won", "tied", "no result"]
     )]
-
-    # set_cache("upcoming", upcoming)
     return upcoming if upcoming else data
 
 
 async def get_recent_matches():
-    """Fetch recently completed cricket matches (results)"""
-    # cache = get_cache("recent", ttl=300)
-    # if cache: return cache
-
     url = f"{BASE}/cricket-match/live-scores/recent-matches"
     html = await fetch(url)
     data = parse_match_cards(html)
-
-    # Filter to only recently completed matches
     recent = [m for m in data if m.get("status") and any(
         kw in m.get("status", "").lower() for kw in ["won", "tied", "result", "stumps", "innings"]
     )]
-
-    # set_cache("recent", recent)
     return recent if recent else data
 
 
 async def get_scorecard(match_id):
-    """Fetch scorecard data from Cricbuzz API - returns full scorecard"""
     url = f"{BASE}/api/mcenter/scorecard/{match_id}"
-    
     try:
         async with httpx.AsyncClient(timeout=20, headers=headers()) as client:
             response = await client.get(url)
@@ -294,16 +278,7 @@ async def get_scorecard(match_id):
         }
 
 
-
 async def get_squads(match_id):
-    # Try cache first (optional)
-    # cache_key = f"squad_{match_id}"
-    # cache = get_cache(cache_key, ttl=86400)
-    # if cache: return cache
-
-    teams = []
-    api_attempts = []
-    # set_cache(cache_key, result)
     url = f"{BASE}/cricket-match-squads/{match_id}"
     html = await fetch(url)
     data = fetch_squads(html)
@@ -360,7 +335,6 @@ def _group_by_category(players):
 def fetch_squads(html):
     soup = BeautifulSoup(html, "html.parser")
 
-    # Full country names sit in the main h1: "Nepal vs United States of America, ..."
     teams = []
     for h1 in soup.find_all("h1"):
         txt = h1.get_text(strip=True)
