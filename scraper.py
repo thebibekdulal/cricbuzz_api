@@ -13,7 +13,7 @@ BASE = "https://www.cricbuzz.com"
 # ---------------------------------------------------------------------------
 # Cache configuration
 # ---------------------------------------------------------------------------
-CACHE_DIR = ".cache"
+CACHE_DIR = "/tmp/.cache"
 
 # TTL in seconds for each endpoint.
 # Remove or comment out an entry to bypass the cache for that endpoint.
